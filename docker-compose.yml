@@ -11,4 +11,9 @@ services:
       - .env
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-development} # Default to development if not set
+      # Use host.docker.internal to access local services from container
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      # Required for host.docker.internal to work on Linux
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped

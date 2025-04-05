@@ -2,31 +2,33 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from app.services.github_service import GitHubService
-from app.services.o3_mini_openai_service import OpenAIo3Service
+from app.services.ollama_service import OllamaService
 from app.prompts import (
     SYSTEM_FIRST_PROMPT,
     SYSTEM_SECOND_PROMPT,
     SYSTEM_THIRD_PROMPT,
     ADDITIONAL_SYSTEM_INSTRUCTIONS_PROMPT,
 )
-from anthropic._exceptions import RateLimitError
 from pydantic import BaseModel
 from functools import lru_cache
 import re
 import json
 import asyncio
+import os
 
 # from app.services.claude_service import ClaudeService
 # from app.core.limiter import limiter
 
 load_dotenv()
 
-router = APIRouter(prefix="/generate", tags=["Claude"])
+router = APIRouter(prefix="/generate", tags=["Generate"])
 
 # Initialize services
 # claude_service = ClaudeService()
-o3_service = OpenAIo3Service()
+llm_service = OllamaService()
 
+# Get default LLM provider from environment
+DEFAULT_LLM_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "openai")  # or "ollama"
 
 # cache github data to avoid double API calls from cost and generate
 @lru_cache(maxsize=100)
@@ -62,29 +64,11 @@ async def get_generation_cost(request: Request, body: ApiRequest):
         readme = github_data["readme"]
 
         # Calculate combined token count
-        # file_tree_tokens = claude_service.count_tokens(file_tree)
-        # readme_tokens = claude_service.count_tokens(readme)
+        file_tree_tokens = llm_service.count_tokens(file_tree)
+        readme_tokens = llm_service.count_tokens(readme)
 
-        file_tree_tokens = o3_service.count_tokens(file_tree)
-        readme_tokens = o3_service.count_tokens(readme)
-
-        # CLAUDE: Calculate approximate cost
-        # Input cost: $3 per 1M tokens ($0.000003 per token)
-        # Output cost: $15 per 1M tokens ($0.000015 per token)
-        # input_cost = ((file_tree_tokens * 2 + readme_tokens) + 3000) * 0.000003
-        # output_cost = 3500 * 0.000015
-        # estimated_cost = input_cost + output_cost
-
-        # Input cost: $1.1 per 1M tokens ($0.0000011 per token)
-        # Output cost: $4.4 per 1M tokens ($0.0000044 per token)
-        input_cost = ((file_tree_tokens * 2 + readme_tokens) + 3000) * 0.0000011
-        output_cost = (
-            8000 * 0.0000044
-        )  # 8k just based on what I've seen (reasoning is expensive)
-        estimated_cost = input_cost + output_cost
-
-        # Format as currency string
-        cost_string = f"${estimated_cost:.2f} USD"
+        # Using local LLM - free to use
+        cost_string = "$0.00 USD (using local LLM)"
         return {"cost": cost_string}
     except Exception as e:
         return {"error": str(e)}
@@ -146,17 +130,6 @@ async def generate_stream(request: Request, body: ApiRequest):
                 yield f"data: {json.dumps({'status': 'started', 'message': 'Starting generation process...'})}\n\n"
                 await asyncio.sleep(0.1)
 
-                # Token count check
-                combined_content = f"{file_tree}\n{readme}"
-                token_count = o3_service.count_tokens(combined_content)
-
-                if 50000 < token_count < 195000 and not body.api_key:
-                    yield f"data: {json.dumps({'error': f'File tree and README combined exceeds token limit (50,000). Current size: {token_count} tokens. This GitHub repository is too large for my wallet, but you can continue by providing your own OpenAI API key.'})}\n\n"
-                    return
-                elif token_count > 195000:
-                    yield f"data: {json.dumps({'error': f'Repository is too large (>195k tokens) for analysis. OpenAI o3-mini\'s max context length is 200k tokens. Current size: {token_count} tokens.'})}\n\n"
-                    return
-
                 # Prepare prompts
                 first_system_prompt = SYSTEM_FIRST_PROMPT
                 third_system_prompt = SYSTEM_THIRD_PROMPT
@@ -173,11 +146,9 @@ async def generate_stream(request: Request, body: ApiRequest):
                     )
 
                 # Phase 1: Get explanation
-                yield f"data: {json.dumps({'status': 'explanation_sent', 'message': 'Sending explanation request to o3-mini...'})}\n\n"
-                await asyncio.sleep(0.1)
-                yield f"data: {json.dumps({'status': 'explanation', 'message': 'Analyzing repository structure...'})}\n\n"
+                yield f"data: {json.dumps({'status': 'explanation_sent', 'message': 'Analyzing repository structure...'})}\n\n"
                 explanation = ""
-                async for chunk in o3_service.call_o3_api_stream(
+                async for chunk in llm_service.call_o3_api_stream(
                     system_prompt=first_system_prompt,
                     data={
                         "file_tree": file_tree,
@@ -195,39 +166,25 @@ async def generate_stream(request: Request, body: ApiRequest):
                     return
 
                 # Phase 2: Get component mapping
-                yield f"data: {json.dumps({'status': 'mapping_sent', 'message': 'Sending component mapping request to o3-mini...'})}\n\n"
-                await asyncio.sleep(0.1)
                 yield f"data: {json.dumps({'status': 'mapping', 'message': 'Creating component mapping...'})}\n\n"
                 full_second_response = ""
-                async for chunk in o3_service.call_o3_api_stream(
+                async for chunk in llm_service.call_o3_api_stream(
                     system_prompt=SYSTEM_SECOND_PROMPT,
                     data={"explanation": explanation, "file_tree": file_tree},
                     api_key=body.api_key,
-                    reasoning_effort="low",
+                    reasoning_effort="medium",
                 ):
                     full_second_response += chunk
                     yield f"data: {json.dumps({'status': 'mapping_chunk', 'chunk': chunk})}\n\n"
 
-                # i dont think i need this anymore? but keep it here for now
-                # Extract component mapping
-                start_tag = "<component_mapping>"
-                end_tag = "</component_mapping>"
-                component_mapping_text = full_second_response[
-                    full_second_response.find(start_tag) : full_second_response.find(
-                        end_tag
-                    )
-                ]
-
                 # Phase 3: Generate Mermaid diagram
-                yield f"data: {json.dumps({'status': 'diagram_sent', 'message': 'Sending diagram generation request to o3-mini...'})}\n\n"
-                await asyncio.sleep(0.1)
                 yield f"data: {json.dumps({'status': 'diagram', 'message': 'Generating diagram...'})}\n\n"
                 mermaid_code = ""
-                async for chunk in o3_service.call_o3_api_stream(
+                async for chunk in llm_service.call_o3_api_stream(
                     system_prompt=third_system_prompt,
                     data={
                         "explanation": explanation,
-                        "component_mapping": component_mapping_text,
+                        "component_mapping": full_second_response,
                         "instructions": body.instructions,
                     },
                     api_key=body.api_key,
@@ -236,35 +193,20 @@ async def generate_stream(request: Request, body: ApiRequest):
                     mermaid_code += chunk
                     yield f"data: {json.dumps({'status': 'diagram_chunk', 'chunk': chunk})}\n\n"
 
-                # Process final diagram
-                mermaid_code = mermaid_code.replace("```mermaid", "").replace("```", "")
-                if "BAD_INSTRUCTIONS" in mermaid_code:
-                    yield f"data: {json.dumps({'error': 'Invalid or unclear instructions provided'})}\n\n"
-                    return
-
-                processed_diagram = process_click_events(
+                # Process click events to include full GitHub URLs
+                mermaid_code = process_click_events(
                     mermaid_code, body.username, body.repo, default_branch
                 )
 
-                # Send final result
-                yield f"data: {json.dumps({
-                    'status': 'complete',
-                    'diagram': processed_diagram,
-                    'explanation': explanation,
-                    'mapping': component_mapping_text
-                })}\n\n"
+                # Send final diagram
+                yield f"data: {json.dumps({'status': 'complete', 'diagram': mermaid_code})}\n\n"
 
             except Exception as e:
+                print(f"Error in event generator: {str(e)}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "X-Accel-Buffering": "no",  # Hint to Nginx
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        )
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
     except Exception as e:
+        print(f"Error in generate_stream: {str(e)}")
         return {"error": str(e)}
